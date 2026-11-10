@@ -10,7 +10,7 @@ repository = "https://github.com/savannahar68/emeans"
 documentation = "https://docs.rs/emeans"
 keywords = ["kmeans", "clustering", "emeans", "vector", "faiss"]
 categories = ["algorithms", "science", "mathematics"]
-exclude = ["/scripts", "/tests/data", "/tests/parity.rs", "/.github"]
+exclude = ["/scripts", "/tests/data", "/tests/parity.rs", "/.github", "/python"]
 
 [features]
 default = ["parallel"]
@@ -29,3 +29,6 @@ lto = "thin"
 
 [dev-dependencies]
 rayon = "1.10"
+
+[workspace]
+members = ["python"]

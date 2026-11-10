@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  rust:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -16,9 +16,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --release
       - run: cargo test --release --no-default-features
       - if: matrix.os == 'macos-latest'
         run: cargo test --release --features accelerate
+
+  python:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pip install maturin pytest numpy
+      - run: maturin build --release -m python/Cargo.toml -o dist
+      - run: pip install dist/*.whl
+      - run: pytest -q python/tests

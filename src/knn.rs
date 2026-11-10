@@ -141,13 +141,7 @@ fn search_block(
 
     scratch.dots.resize(m * tile, 0.0);
     scratch.best.clear();
-    scratch.best.resize(
-        m,
-        match metric {
-            Metric::L2 => f32::INFINITY,
-            Metric::InnerProduct => f32::NEG_INFINITY,
-        },
-    );
+    scratch.best.resize(m, f32::INFINITY);
     labels.fill(0);
 
     for start in (0..k).step_by(tile) {
@@ -160,33 +154,14 @@ fn search_block(
             &centroids[start * d..(start + width) * d],
             &mut scratch.dots,
         );
-        let rows = scratch
-            .dots
-            .chunks_exact(width)
-            .zip(scratch.best.iter_mut())
-            .zip(labels.iter_mut());
-        for ((dots, best), label) in rows {
-            match metric {
-                Metric::L2 => {
-                    let norms = &centroid_norms[start..start + width];
-                    for (j, (&dot, &norm)) in dots.iter().zip(norms).enumerate() {
-                        let score = norm - 2.0 * dot;
-                        if score < *best {
-                            *best = score;
-                            *label = (start + j) as u32;
-                        }
-                    }
-                }
-                Metric::InnerProduct => {
-                    for (j, &dot) in dots.iter().enumerate() {
-                        if dot > *best {
-                            *best = dot;
-                            *label = (start + j) as u32;
-                        }
-                    }
-                }
-            }
-        }
+        scan_tile(
+            &scratch.dots[..m * width],
+            &centroid_norms[start..start + width],
+            start as u32,
+            metric,
+            &mut scratch.best,
+            labels,
+        );
     }
 
     for i in 0..m {
@@ -196,8 +171,146 @@ fn search_block(
                 let norm: f32 = row.iter().map(|v| v * v).sum();
                 (norm + scratch.best[i]).max(0.0)
             }
-            Metric::InnerProduct => scratch.best[i],
+            // The scan kept -dot.
+            Metric::InnerProduct => -scratch.best[i],
         };
+    }
+}
+
+/// Lanes of the vectorized scan. 16 floats fill one AVX-512 register.
+const LANES: usize = 16;
+
+/// For each row of `dots` (one row per data row, one column per centroid of the tile),
+/// keep the best score and its centroid id in `best` and `labels`.
+///
+/// L2 looks for the smallest `norm - 2 * dot`, inner product for the largest dot.
+/// Ties go to the lowest id, the same as a plain loop.
+///
+/// The work is written over 16 lanes so the compiler turns it into SIMD. On x86 it is
+/// compiled for AVX-512 and AVX2 too, and the best one is picked once at run time from
+/// what the CPU supports. Other CPUs (and ARM, where NEON is always on) use the plain build.
+fn scan_tile(
+    dots: &[f32],
+    norms: &[f32],
+    start: u32,
+    metric: Metric,
+    best: &mut [f32],
+    labels: &mut [u32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU supports AVX-512F, checked just above.
+            return unsafe { scan_tile_avx512(dots, norms, start, metric, best, labels) };
+        }
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: the CPU supports AVX2 and FMA, checked just above.
+            return unsafe { scan_tile_avx2(dots, norms, start, metric, best, labels) };
+        }
+    }
+    scan_tile_any(dots, norms, start, metric, best, labels)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+fn scan_tile_avx512(
+    dots: &[f32],
+    norms: &[f32],
+    start: u32,
+    metric: Metric,
+    best: &mut [f32],
+    labels: &mut [u32],
+) {
+    scan_tile_any(dots, norms, start, metric, best, labels)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn scan_tile_avx2(
+    dots: &[f32],
+    norms: &[f32],
+    start: u32,
+    metric: Metric,
+    best: &mut [f32],
+    labels: &mut [u32],
+) {
+    scan_tile_any(dots, norms, start, metric, best, labels)
+}
+
+#[inline(always)]
+fn scan_tile_any(
+    dots: &[f32],
+    norms: &[f32],
+    start: u32,
+    metric: Metric,
+    best: &mut [f32],
+    labels: &mut [u32],
+) {
+    let width = norms.len();
+    let rows = dots
+        .chunks_exact(width)
+        .zip(best.iter_mut())
+        .zip(labels.iter_mut());
+    for ((row, best), label) in rows {
+        match metric {
+            Metric::L2 => scan_row::<true>(row, norms, start, best, label),
+            Metric::InnerProduct => scan_row::<false>(row, norms, start, best, label),
+        }
+    }
+}
+
+/// Score of one centroid: `norm - 2 * dot` for L2, `-dot` for inner product, so that
+/// lower is always better. `best` holds this score until the end of the block.
+#[inline(always)]
+fn score<const L2: bool>(dot: f32, norm: f32) -> f32 {
+    if L2 { norm - 2.0 * dot } else { -dot }
+}
+
+#[inline(always)]
+fn scan_row<const L2: bool>(
+    row: &[f32],
+    norms: &[f32],
+    start: u32,
+    best: &mut f32,
+    label: &mut u32,
+) {
+    let mut lane_best = [f32::INFINITY; LANES];
+    let mut lane_id = [0u32; LANES];
+    let mut ids: [u32; LANES] = std::array::from_fn(|l| l as u32);
+    let (dot_chunks, _) = row.as_chunks::<LANES>();
+    let (norm_chunks, _) = norms.as_chunks::<LANES>();
+    let tail = dot_chunks.len() * LANES;
+    for (dots, norms) in dot_chunks.iter().zip(norm_chunks) {
+        for l in 0..LANES {
+            let s = score::<L2>(dots[l], norms[l]);
+            let better = s < lane_best[l];
+            lane_best[l] = if better { s } else { lane_best[l] };
+            lane_id[l] = if better { ids[l] } else { lane_id[l] };
+            ids[l] += LANES as u32;
+        }
+    }
+    if tail > 0 {
+        // Lowest score over the lanes, lowest id on ties.
+        let (mut v, mut id) = (lane_best[0], lane_id[0]);
+        for l in 1..LANES {
+            if lane_best[l] < v || (lane_best[l] == v && lane_id[l] < id) {
+                v = lane_best[l];
+                id = lane_id[l];
+            }
+        }
+        // Earlier tiles have lower ids, so only a strictly better score wins.
+        if v < *best {
+            *best = v;
+            *label = start + id;
+        }
+    }
+    for (j, (&dot, &norm)) in row[tail..].iter().zip(&norms[tail..]).enumerate() {
+        let s = score::<L2>(dot, norm);
+        if s < *best {
+            *best = s;
+            *label = start + (tail + j) as u32;
+        }
     }
 }
 

@@ -12,25 +12,20 @@ fn read(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+fn words(name: &str) -> Vec<[u8; 4]> {
+    read(name).as_chunks::<4>().0.to_vec()
+}
+
 fn f32s(name: &str) -> Vec<f32> {
-    read(name)
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
+    words(name).into_iter().map(f32::from_le_bytes).collect()
 }
 
 fn u32s(name: &str) -> Vec<u32> {
-    read(name)
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
+    words(name).into_iter().map(u32::from_le_bytes).collect()
 }
 
 fn i32s(name: &str) -> Vec<i32> {
-    read(name)
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
+    words(name).into_iter().map(i32::from_le_bytes).collect()
 }
 
 fn check(name: &str, nepochs: f64, spherical: bool) {

@@ -216,7 +216,7 @@ impl Emeans {
 
     fn rows_of(&self, x: &[f32]) -> Result<usize> {
         self.check()?;
-        if x.len() % self.d != 0 {
+        if !x.len().is_multiple_of(self.d) {
             return invalid(format!(
                 "data length {} is not a multiple of d = {}",
                 x.len(),
@@ -473,7 +473,7 @@ impl Trainer {
     }
 
     fn check_rows(&self, rows: &[f32]) -> Result<()> {
-        if rows.len() % self.d != 0 {
+        if !rows.len().is_multiple_of(self.d) {
             return invalid(format!(
                 "batch length {} is not a multiple of d = {}",
                 rows.len(),
@@ -573,7 +573,7 @@ impl Trainer {
         }
         let alpha = recipe::scheduled_alpha(self.recipe.alpha0, self.step, self.recipe.total_steps);
         self.apply_batch(alpha);
-        if (self.step + 1) % recipe::CHECK_UNUSED_EVERY == 0 {
+        if (self.step + 1).is_multiple_of(recipe::CHECK_UNUSED_EVERY) {
             self.revive_unused();
         }
         self.refresh_search();
@@ -806,7 +806,7 @@ pub struct Model {
 impl Model {
     /// Wrap centroids you already have, for example loaded from disk, to call [`Model::assign`].
     pub fn from_centroids(d: usize, centroids: Vec<f32>, spherical: bool) -> Result<Model> {
-        if d == 0 || centroids.is_empty() || centroids.len() % d != 0 {
+        if d == 0 || centroids.is_empty() || !centroids.len().is_multiple_of(d) {
             return invalid("centroids must hold k * d values with k, d >= 1");
         }
         let k = centroids.len() / d;
@@ -889,7 +889,7 @@ impl Model {
     /// Nearest centroid of each row of `x`, and its squared distance.
     /// In spherical mode, the highest inner product instead (higher is closer).
     pub fn assign(&self, x: &[f32]) -> Result<(Vec<f32>, Vec<i64>)> {
-        if x.len() % self.d != 0 {
+        if !x.len().is_multiple_of(self.d) {
             return invalid(format!(
                 "data length {} is not a multiple of d = {}",
                 x.len(),

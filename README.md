@@ -12,7 +12,12 @@ Almost all the time goes into finding the nearest centroid of each row. Here it 
 - a vectorized scan for the smallest distance, built for AVX-512, AVX2 and plain, picked at run time from the CPU,
 - spread over all cores with `rayon`, with the same result for any number of threads.
 
-No feature flag is needed for SIMD. The optional `accelerate` feature (macOS only) uses Apple's matrix unit for the multiply.
+No feature flag is needed for SIMD. Two optional features swap the matrix multiply:
+
+- `mkl`: Intel MKL, 10-15% faster on Intel. Needs `libmkl_rt` (set `MKL_LIB_DIR` if it is not found).
+- `accelerate` (macOS only): Apple's matrix unit, about 2x faster. Apple's library can take several hundred MB more memory on wide vectors (d=768), so it is not on by default.
+
+Memory: on top of your data, training needs about 20-30 MB, plus 8 bytes per row for the labels.
 
 ## Numbers
 
@@ -35,6 +40,13 @@ Apple M4, 10 cores:
 | 1M, 128, 1024 | 7.01 s | 3.06 s | 1.50 s |
 | 1M, 32, 4096 | 10.05 s | 3.04 s | 1.99 s |
 | 500k, 768, 256 | 11.42 s | 3.08 s | 1.90 s |
+
+Other Rust crates on the same Xeon, 5 iterations, time / error / peak memory:
+
+| n, d, k | emeans | [fastkmeans-rs](https://crates.io/crates/fastkmeans-rs) | [kmeans_uni](https://crates.io/crates/kmeans_uni) |
+|---|---|---|---|
+| 200k, 64, 500 | 0.30 s / 4.502 / 63 MB | 0.56 s / 4.533 / 490 MB | 7.75 s / 4.533 / 59 MB |
+| 1M, 128, 1024 | 4.52 s / 9.719 / 539 MB | 5.78 s / 9.751 / 2.68 GB | 128.8 s / 9.751 / 529 MB |
 
 Run it yourself: `cargo run --release --example bench -- 1000000 128 1024`.
 

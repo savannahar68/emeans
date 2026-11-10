@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "emeans"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast e-means clustering (k-means in a tenth of the passes), written in Rust"
 readme = "README.md"
 license = { text = "MIT" }

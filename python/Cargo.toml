@@ -1,6 +1,6 @@
 [package]
 name = "emeans-python"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -10,6 +10,7 @@ name = "_emeans"
 crate-type = ["cdylib"]
 
 [features]
+mkl = ["emeans/mkl"]
 accelerate = ["emeans/accelerate"]
 
 [dependencies]

@@ -315,7 +315,7 @@ fn scan_row<const L2: bool>(
 }
 
 /// `dots[m x width] = block[m x d] * tile[width x d]^T`, all row major.
-#[cfg(not(feature = "accelerate"))]
+#[cfg(not(emeans_blas))]
 fn dot_tile(m: usize, d: usize, width: usize, block: &[f32], tile: &[f32], dots: &mut [f32]) {
     assert!(block.len() >= m * d && tile.len() >= width * d && dots.len() >= m * width);
     // SAFETY: the asserts above cover every element the strides reach. The tile is
@@ -340,7 +340,7 @@ fn dot_tile(m: usize, d: usize, width: usize, block: &[f32], tile: &[f32], dots:
     }
 }
 
-#[cfg(feature = "accelerate")]
+#[cfg(emeans_blas)]
 unsafe extern "C" {
     fn cblas_sgemm(
         order: i32,
@@ -360,9 +360,12 @@ unsafe extern "C" {
     );
 }
 
-/// Same as above with Apple's Accelerate, which uses the matrix unit of Apple chips.
-#[cfg(feature = "accelerate")]
+/// Same as above with a system BLAS: Accelerate on macOS (uses the matrix unit of Apple
+/// chips), or MKL with the `mkl` feature. Each call runs on one thread, rayon already
+/// uses every core.
+#[cfg(emeans_blas)]
 fn dot_tile(m: usize, d: usize, width: usize, block: &[f32], tile: &[f32], dots: &mut [f32]) {
+    single_threaded_blas();
     const ROW_MAJOR: i32 = 101;
     const NO_TRANS: i32 = 111;
     const TRANS: i32 = 112;
@@ -388,6 +391,23 @@ fn dot_tile(m: usize, d: usize, width: usize, block: &[f32], tile: &[f32], dots:
         );
     }
 }
+
+#[cfg(feature = "mkl")]
+fn single_threaded_blas() {
+    unsafe extern "C" {
+        fn MKL_Set_Threading_Layer(layer: i32) -> i32;
+    }
+    const MKL_THREADING_SEQUENTIAL: i32 = 1;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: plain call into MKL, made once before the first multiply.
+    ONCE.call_once(|| unsafe {
+        MKL_Set_Threading_Layer(MKL_THREADING_SEQUENTIAL);
+    });
+}
+
+// Accelerate decides its own threads. Small calls like ours stay on the calling thread.
+#[cfg(all(emeans_blas, not(feature = "mkl")))]
+fn single_threaded_blas() {}
 
 #[cfg(test)]
 mod tests {

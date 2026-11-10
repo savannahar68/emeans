@@ -1,6 +1,6 @@
 [package]
 name = "emeans"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "e-means clustering in Rust, a port of the CPU version from faiss/contrib/e_means"
@@ -16,7 +16,11 @@ exclude = ["/scripts", "/tests/data", "/tests/parity.rs", "/.github", "/python"]
 default = ["parallel"]
 # Search the nearest centroids on all cores with rayon.
 parallel = ["dep:rayon"]
-# macOS only: use Apple Accelerate for the matrix multiply.
+# Use Intel MKL (libmkl_rt) for the matrix multiply, about 10-15% faster on Intel.
+# Set MKL_LIB_DIR if libmkl_rt is not on the default search path.
+mkl = []
+# macOS only: use Apple Accelerate for the matrix multiply. About 2x faster on Apple
+# chips, but Accelerate can use several hundred MB more memory on wide vectors.
 accelerate = []
 
 [dependencies]

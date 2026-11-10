@@ -1,0 +1,31 @@
+[package]
+name = "emeans"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "e-means clustering in Rust, a port of the CPU version from faiss/contrib/e_means"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/savannahar68/emeans"
+documentation = "https://docs.rs/emeans"
+keywords = ["kmeans", "clustering", "emeans", "vector", "faiss"]
+categories = ["algorithms", "science", "mathematics"]
+exclude = ["/scripts", "/tests/data", "/tests/parity.rs", "/.github"]
+
+[features]
+default = ["parallel"]
+# Search the nearest centroids on all cores with rayon.
+parallel = ["dep:rayon"]
+# macOS only: use Apple Accelerate for the matrix multiply.
+accelerate = []
+
+[dependencies]
+matrixmultiply = "0.3.10"
+rayon = { version = "1.10", optional = true }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[dev-dependencies]
+rayon = "1.10"

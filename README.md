@@ -21,9 +21,9 @@ Memory: on top of your data, training needs about 20-30 MB, plus 8 bytes per row
 
 ## Numbers
 
-5 passes on random data, time to train. faiss is `NumpyEmeans` from faiss-cpu 1.15. The final error is the same for all.
+5 passes on random data, time to train. faiss is `NumpyEmeans` from faiss-cpu (1.15 on Intel, 1.16 on ARM). The final error is the same for all.
 
-Intel Xeon 8481C, 8 vCPU (GCP c3-standard-8):
+Linux, Intel CPU, 8 cores (Xeon on Google Cloud):
 
 | n, d, k | faiss (Python) | emeans (Python) |
 |---|---|---|
@@ -32,7 +32,16 @@ Intel Xeon 8481C, 8 vCPU (GCP c3-standard-8):
 | 1M, 32, 4096 | 6.94 s | 4.11 s |
 | 500k, 768, 256 | 24.87 s | 4.08 s |
 
-Apple M4, 10 cores:
+Linux, ARM CPU, 8 cores (Google Axion on Google Cloud):
+
+| n, d, k | faiss (Python) | emeans (Python) |
+|---|---|---|
+| 200k, 64, 500 | 0.87 s | 0.21 s |
+| 1M, 128, 1024 | 9.68 s | 3.22 s |
+| 1M, 32, 4096 | 6.48 s | 3.11 s |
+| 500k, 768, 256 | 17.80 s | 2.93 s |
+
+Mac, Apple M4, 10 cores:
 
 | n, d, k | faiss (Python) | emeans (Python) | emeans + `accelerate` (Rust) |
 |---|---|---|---|
@@ -41,7 +50,7 @@ Apple M4, 10 cores:
 | 1M, 32, 4096 | 10.05 s | 3.04 s | 1.99 s |
 | 500k, 768, 256 | 11.42 s | 3.08 s | 1.90 s |
 
-Other Rust crates on the same Xeon, 5 iterations, time / error / peak memory:
+Other Rust crates on the same Intel machine, 5 iterations, time / error / peak memory:
 
 | n, d, k | emeans | [fastkmeans-rs](https://crates.io/crates/fastkmeans-rs) | [kmeans_uni](https://crates.io/crates/kmeans_uni) |
 |---|---|---|---|

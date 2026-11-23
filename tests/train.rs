@@ -90,6 +90,34 @@ fn thread_count_does_not_change_the_result() {
     assert_eq!(one.labels(), many.labels());
 }
 
+#[cfg(feature = "parallel")]
+#[test]
+fn thread_count_does_not_change_train_from() {
+    // Odd width and odd thread counts so rows and tiles split unevenly.
+    let (n, d, k) = (30_000, 100, 128);
+    let x = blobs(n, d, 90, 5);
+    let init = x[..k * d].to_vec();
+    let run = |threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                Emeans::new(d, k)
+                    .nepochs(5.0)
+                    .seed(11)
+                    .train_from(&x, &init)
+                    .unwrap()
+            })
+    };
+    let one = run(1);
+    for threads in [3, 7, 32] {
+        let many = run(threads);
+        assert_eq!(one.centroids(), many.centroids(), "threads {threads}");
+        assert_eq!(one.labels(), many.labels(), "threads {threads}");
+    }
+}
+
 #[test]
 fn dead_clusters_are_revived() {
     // Start every centroid on top of one point: most clusters get nothing at first.

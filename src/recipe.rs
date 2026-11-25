@@ -8,12 +8,14 @@ pub(crate) const ALPHA_MIN_FACTOR: f64 = 0.1;
 pub(crate) const CHECK_UNUSED_EVERY: usize = 5;
 /// Starting mass of every cluster.
 pub(crate) const INIT_USAGE: f32 = 1.0 / 65536.0;
-/// Relative shift applied when a busy cluster is split in two.
-pub(crate) const SPLIT_EPSILON: f32 = 1e-4;
-/// Default revival threshold, as a fraction of the mean mass.
+/// Mass based revival: revive clusters below this fraction of the mean mass.
 pub(crate) const UNUSED_THRESHOLD: f32 = 0.1;
-/// Revival is off by default at or below this dimension.
+/// Mass based revival is off at or below this dimension. Only used when `k = 1`, where
+/// cost based revival has nothing to compare.
 pub(crate) const NO_REVIVAL_MAX_D: usize = 2;
+/// Cost based revival moves clusters whose removal cost is below this fraction of the
+/// median, or not positive.
+pub(crate) const REMOVAL_THRESHOLD: f64 = 0.3;
 /// `BatchLaw::Auto` picks the quality law at or below this dimension.
 pub(crate) const AUTO_QUALITY_MAX_D: usize = 16;
 
@@ -64,8 +66,9 @@ pub struct Recipe {
     pub epoch_rows: Vec<usize>,
     /// Updates in each pass.
     pub epoch_steps: Vec<usize>,
-    /// Clusters with a mass below this fraction of the mean are revived. 0 turns revival off.
-    pub unused_threshold: f32,
+    /// `None` for cost based revival (the default). Otherwise clusters with a mass below
+    /// this fraction of the mean are revived, and 0 turns revival off.
+    pub unused_threshold: Option<f32>,
     /// Seed of the starting centroids, the shuffles and the revivals.
     pub seed: u64,
     /// Rows searched at once. Only changes memory use.

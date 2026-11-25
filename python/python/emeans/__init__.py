@@ -30,9 +30,15 @@ class Emeans:
     ``nepochs`` is the number of passes over the data (can be fractional).
     The batch size and the starting step size come from fitted laws unless
     ``batch_size`` or ``alpha0`` are given. ``batch_law`` is ``"auto"``,
-    ``"throughput"`` or ``"quality"``. ``unused_threshold=None`` means 0.1,
-    or 0 (no revival) when d <= 2. With ``spherical=True``, the input rows
-    must already have norm 1 and ``assign`` returns similarities.
+    ``"throughput"`` or ``"quality"``. With ``spherical=True``, the input
+    rows must already have norm 1 and ``assign`` returns similarities.
+
+    ``unused_threshold=None`` revives clusters by cost: every 5 updates, the
+    clusters whose removal would cost little move to split the clusters with
+    the longest axes. A number switches to mass based revival (clusters below
+    that fraction of the mean mass), and 0 turns revival off. With
+    ``closing_handover=True``, ``train`` fixes the last pass labels of rows
+    whose cluster moved after they were assigned.
 
     Training runs without the GIL, on all cores. Set ``RAYON_NUM_THREADS``
     before the first call to use fewer.
@@ -54,6 +60,7 @@ class Emeans:
         *,
         unused_threshold=None,
         max_points_per_centroid=None,
+        closing_handover=True,
     ):
         self.d = int(d)
         self.k = int(k)
@@ -72,6 +79,7 @@ class Emeans:
             self.spherical,
             None if unused_threshold is None else float(unused_threshold),
             None if max_points_per_centroid is None else int(max_points_per_centroid),
+            bool(closing_handover),
         )
         self.centroids = None
         self.assignments = None

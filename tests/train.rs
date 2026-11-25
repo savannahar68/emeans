@@ -172,11 +172,16 @@ fn recipe_follows_the_laws() {
     assert_eq!(r.epoch_rows, vec![200_000; 5]);
     let r = Emeans::new(8, 500).recipe(200_000).unwrap();
     assert_eq!(r.batch_law, Some(BatchLaw::Quality));
-    assert_eq!(r.unused_threshold, 0.1);
-    assert_eq!(
-        Emeans::new(2, 5).recipe(1000).unwrap().unused_threshold,
-        0.0
-    );
+    // Cost based revival by default, mass based only when asked or when k = 1.
+    assert_eq!(r.unused_threshold, None);
+    let r = Emeans::new(8, 500)
+        .unused_threshold(0.2)
+        .recipe(1000)
+        .unwrap();
+    assert_eq!(r.unused_threshold, Some(0.2));
+    let one = |d| Emeans::new(d, 1).recipe(1000).unwrap().unused_threshold;
+    assert_eq!(one(8), Some(0.1));
+    assert_eq!(one(2), Some(0.0));
 }
 
 #[test]
@@ -224,4 +229,114 @@ fn wrong_inputs_are_errors() {
     assert!(matches!(t.end_epoch(), Err(Error::WrongOrder(_))));
     let too_many = vec![0.0f32; (t.batch_rows() + 1) * 10];
     assert!(matches!(t.accumulate(&too_many), Err(Error::WrongOrder(_))));
+}
+
+/// Gaussian rows around `centers` random centers, like the faiss tests.
+fn gaussian_blobs(n: usize, d: usize, centers: usize, spread: f32, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut uniform = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+    };
+    let mut normal = move || {
+        let (u, v) = (uniform(), uniform());
+        (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
+    };
+    let means: Vec<f32> = (0..centers * d).map(|_| normal() * spread).collect();
+    let mut x = Vec::with_capacity(n * d);
+    for i in 0..n {
+        let c = (i * 7919) % centers;
+        for j in 0..d {
+            x.push(means[c * d + j] + normal());
+        }
+    }
+    x
+}
+
+#[test]
+fn cost_based_revival_keeps_a_small_far_blob() {
+    // 4000 rows near 0 and 40 rows near 20. One centroid starts far away and gets no
+    // rows. Mass based revival moves the small blob's centroid, cost based keeps it.
+    let d = 4;
+    let mut x = gaussian_blobs(4000, d, 1, 0.0, 1);
+    x.extend(gaussian_blobs(40, d, 1, 0.0, 2).iter().map(|v| v + 20.0));
+    let mut init = x[..2 * d].to_vec();
+    init.extend_from_slice(&x[x.len() - d..]);
+    init.extend([-50.0; 4]);
+    for (threshold, far_kept) in [(None, true), (Some(0.1), false)] {
+        let mut em = Emeans::new(d, 4).nepochs(3.0);
+        if let Some(t) = threshold {
+            em = em.unused_threshold(t);
+        }
+        let model = em.train_from(&x, &init).unwrap();
+        let near_far_blob =
+            (0..4).any(|j| model.centroid(j).iter().all(|v| (v - 20.0).abs() < 1.0));
+        assert_eq!(near_far_blob, far_kept, "threshold {threshold:?}");
+        // The dead centroid moved.
+        assert!(model.centroids().iter().all(|v| v.abs() < 30.0));
+    }
+}
+
+#[test]
+fn revival_continues_in_the_last_pass() {
+    let (n, d, k) = (20_000, 8, 64);
+    let x = gaussian_blobs(n, d, 64, 4.0, 3);
+    let model = Emeans::new(d, k)
+        .nepochs(1.6)
+        .batch_size(500)
+        .train_from(&x, &x[..k * d])
+        .unwrap();
+    assert!(model.epoch_stats().last().unwrap().n_splits > 0);
+}
+
+#[test]
+fn handover_centroids_are_means_of_final_labels() {
+    // One pass from a bad start, so many clusters move while the labels are taken.
+    let (n, d, k) = (20_000, 8, 64);
+    let x = gaussian_blobs(n, d, 64, 4.0, 4);
+    let init: Vec<f32> = x[..k * d].to_vec();
+    let em = Emeans::new(d, k).nepochs(1.0).batch_size(500);
+    let model = em.train_from(&x, &init).unwrap();
+    assert!(model.n_splits() > 0);
+    let labels = model.labels().unwrap();
+    let mut sums = vec![0.0f64; k * d];
+    let mut counts = vec![0usize; k];
+    for (row, &l) in x.chunks_exact(d).zip(labels) {
+        let l = l as usize;
+        counts[l] += 1;
+        for (s, &v) in sums[l * d..(l + 1) * d].iter_mut().zip(row) {
+            *s += v as f64;
+        }
+    }
+    for j in (0..k).filter(|&j| counts[j] > 0) {
+        for c in 0..d {
+            let mean = sums[j * d + c] / counts[j] as f64;
+            assert!((model.centroid(j)[c] as f64 - mean).abs() < 1e-4);
+        }
+    }
+    // The handover should not cost error compared with dropping it.
+    let without = em.closing_handover(false).train_from(&x, &init).unwrap();
+    assert!(mse(&model, &x) <= mse(&without, &x) * 1.01);
+}
+
+#[test]
+fn spherical_cost_based_revival_runs() {
+    let (n, d, k) = (5000, 16, 40);
+    let mut x = gaussian_blobs(n, d, 20, 3.0, 5);
+    for row in x.chunks_exact_mut(d) {
+        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        row.iter_mut().for_each(|v| *v /= norm);
+    }
+    let init: Vec<f32> = (0..k).flat_map(|_| x[..d].iter().copied()).collect();
+    let model = Emeans::new(d, k)
+        .spherical(true)
+        .train_from(&x, &init)
+        .unwrap();
+    assert!(model.n_splits() > 0);
+    for j in 0..k {
+        let norm = model.centroid(j).iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
 }

@@ -57,6 +57,7 @@ impl Native {
         spherical: bool,
         unused_threshold: Option<f32>,
         max_points_per_centroid: Option<usize>,
+        closing_handover: bool,
     ) -> PyResult<Self> {
         let law = match batch_law {
             "auto" => BatchLaw::Auto,
@@ -75,6 +76,7 @@ impl Native {
             .verbose(verbose)
             .chunk_size(chunk_size)
             .capture_assignments(capture_assignments)
+            .closing_handover(closing_handover)
             .spherical(spherical);
         if let Some(b) = batch_size {
             config = config.batch_size(b);

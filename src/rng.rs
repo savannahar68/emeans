@@ -55,6 +55,18 @@ impl Rng {
         (m >> 64) as u64
     }
 
+    /// Standard normal, by the polar method.
+    pub(crate) fn normal(&mut self) -> f64 {
+        loop {
+            let u = 2.0 * self.next_f64() - 1.0;
+            let v = 2.0 * self.next_f64() - 1.0;
+            let s = u * u + v * v;
+            if s > 0.0 && s < 1.0 {
+                return u * (-2.0 * s.ln() / s).sqrt();
+            }
+        }
+    }
+
     /// A random permutation of 0..n.
     pub(crate) fn permutation(&mut self, n: usize) -> Vec<usize> {
         let mut order: Vec<usize> = (0..n).collect();
@@ -100,6 +112,18 @@ mod tests {
         assert_eq!(s.len(), 500);
         assert!(s.windows(2).all(|w| w[0] < w[1]));
         assert!(*s.last().unwrap() < 10_000);
+    }
+
+    #[test]
+    fn normal_has_mean_0_and_variance_1() {
+        let mut rng = Rng::new(7);
+        let v: Vec<f64> = (0..100_000).map(|_| rng.normal()).collect();
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / v.len() as f64;
+        assert!(
+            mean.abs() < 0.02 && (var - 1.0).abs() < 0.02,
+            "{mean} {var}"
+        );
     }
 
     #[test]

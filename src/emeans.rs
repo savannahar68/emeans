@@ -43,6 +43,7 @@ pub struct Emeans {
     max_points_per_centroid: Option<usize>,
     spherical: bool,
     capture_assignments: bool,
+    closing_handover: bool,
     chunk_size: usize,
     verbose: bool,
 }
@@ -62,6 +63,7 @@ impl Emeans {
             max_points_per_centroid: None,
             spherical: false,
             capture_assignments: true,
+            closing_handover: true,
             chunk_size: 65536,
             verbose: false,
         }
@@ -97,8 +99,13 @@ impl Emeans {
         self
     }
 
-    /// Revive clusters whose mass falls below this fraction of the mean. 0 turns it off.
-    /// Default 0.1, or 0 when `d <= 2`.
+    /// Switch to mass based revival: revive clusters whose mass falls below this fraction
+    /// of the mean, as faiss did before. 0 turns revival off.
+    ///
+    /// Without this call, revival is cost based. Each cluster tracks how much the error
+    /// would grow without it (the gap between each point's nearest and second nearest
+    /// centroid) and its long axis. Every 5 updates, the clusters that cost less than
+    /// 0.3 times the median move to split the clusters with the longest axes.
     pub fn unused_threshold(mut self, threshold: f32) -> Self {
         self.unused_threshold = Some(threshold);
         self
@@ -121,6 +128,16 @@ impl Emeans {
     /// Keep each row's label from the last pass (8 bytes per row). Default true.
     pub fn capture_assignments(mut self, capture: bool) -> Self {
         self.capture_assignments = capture;
+        self
+    }
+
+    /// With cost based revival, a cluster can move during the last pass after some rows
+    /// were already given to it. When this is on (the default) and the labels are kept,
+    /// `train` fixes those rows at the end: they go to their second nearest centroid, or
+    /// are searched again if that one moved too. Each centroid is then the mean of its
+    /// final rows.
+    pub fn closing_handover(mut self, on: bool) -> Self {
+        self.closing_handover = on;
         self
     }
 
@@ -192,13 +209,12 @@ impl Emeans {
             return invalid("nepochs is too small: the run would see no rows");
         }
         let epoch_steps: Vec<usize> = epoch_rows.iter().map(|r| r.div_ceil(batch_size)).collect();
-        let unused_threshold =
-            self.unused_threshold
-                .unwrap_or(if self.d <= recipe::NO_REVIVAL_MAX_D {
-                    0.0
-                } else {
-                    recipe::UNUSED_THRESHOLD
-                });
+        let unused_threshold = match self.unused_threshold {
+            Some(t) => Some(t),
+            None if self.k > 1 => None,
+            None if self.d <= recipe::NO_REVIVAL_MAX_D => Some(0.0),
+            None => Some(recipe::UNUSED_THRESHOLD),
+        };
         Ok(Recipe {
             batch_law,
             batch_size,
@@ -290,27 +306,59 @@ impl Emeans {
         };
         let mut trainer = self.begin(n, init)?;
         let mut labels = self.capture_assignments.then(|| vec![-1i64; n]);
-        let mut batch_labels = Vec::new();
+        let handover = labels.is_some() && self.closing_handover && trainer.removal_cost();
+        let mut second = if handover {
+            vec![u32::MAX; n]
+        } else {
+            Vec::new()
+        };
+        let (mut batch_labels, mut batch_second) = (Vec::new(), Vec::new());
         let batch_size = trainer.recipe.batch_size;
         let epochs = trainer.recipe.epoch_rows.clone();
+        let mut order = Vec::new();
         for (epoch, &rows) in epochs.iter().enumerate() {
-            let order = stream(self.seed, STREAM_EPOCH + epoch as u64).permutation(n);
+            order = stream(self.seed, STREAM_EPOCH + epoch as u64).permutation(n);
             let last = epoch + 1 == epochs.len();
+            if last && handover {
+                trainer.closing = Some(Closing::new(self.k));
+            }
             for batch in order[..rows].chunks(batch_size) {
                 match labels.as_mut() {
                     Some(labels) if last => {
                         batch_labels.resize(batch.len(), 0);
-                        trainer
-                            .accumulate_rows(Rows::Indexed(x, batch), Some(&mut batch_labels))?;
+                        let second_out = if handover {
+                            batch_second.resize(batch.len(), 0);
+                            Some(batch_second.as_mut_slice())
+                        } else {
+                            None
+                        };
+                        trainer.accumulate_rows(
+                            Rows::Indexed(x, batch),
+                            Some(&mut batch_labels),
+                            second_out,
+                        )?;
                         for (&i, &label) in batch.iter().zip(&batch_labels) {
                             labels[i] = label;
                         }
+                        if handover {
+                            for (&i, &s) in batch.iter().zip(&batch_second) {
+                                second[i] = s;
+                            }
+                        }
+                        if let Some(closing) = trainer.closing.as_mut() {
+                            closing.done += batch.len();
+                        }
                     }
-                    _ => trainer.accumulate_rows(Rows::Indexed(x, batch), None)?,
+                    _ => trainer.accumulate_rows(Rows::Indexed(x, batch), None, None)?,
                 }
                 trainer.update()?;
             }
             trainer.end_epoch()?;
+        }
+        if let Some(labels) = labels.as_mut()
+            && handover
+        {
+            trainer.close_handover(x, &order[..epochs[epochs.len() - 1]], labels, &second);
         }
         let mut model = trainer.finalize()?;
         model.labels = labels;
@@ -340,6 +388,11 @@ impl Emeans {
                 normalize(row);
             }
         }
+        let mut split_rng = stream(self.seed, STREAM_SPLITS);
+        // Revival places each split along the donor's long axis, so every mode that
+        // revives tracks the axes. Only cost based revival needs the second nearest.
+        let removal =
+            (recipe.unused_threshold != Some(0.0)).then(|| Removal::new(k, d, &mut split_rng));
         let mut trainer = Trainer {
             d,
             k,
@@ -363,11 +416,16 @@ impl Emeans {
             epoch_rows_done: 0,
             splits_before: 0,
             n_splits: 0,
-            split_rng: stream(self.seed, STREAM_SPLITS),
+            split_rng,
+            removal,
+            closing: None,
             epoch_stats: Vec::new(),
             start: Instant::now(),
             dist: Vec::new(),
             labels: Vec::new(),
+            dist2: Vec::new(),
+            labels2: Vec::new(),
+            margin: Vec::new(),
         };
         trainer.start_epoch();
         if self.verbose {
@@ -424,10 +482,74 @@ pub struct Trainer {
     splits_before: usize,
     n_splits: usize,
     split_rng: Rng,
+    removal: Option<Removal>,
+    closing: Option<Closing>,
     epoch_stats: Vec<EpochStats>,
     start: Instant,
     dist: Vec<f32>,
     labels: Vec<u32>,
+    dist2: Vec<f32>,
+    labels2: Vec<u32>,
+    margin: Vec<f32>,
+}
+
+/// What revival needs to know about each cluster.
+struct Removal {
+    /// Per cluster `[U / scale | R]`: the moving average of `p * y` over the cluster's
+    /// rows (`y` = row - centroid, `p` = `y` along the axis), and the moving average of
+    /// the removal cost `d2 - d1`.
+    stats: Vec<f32>,
+    /// U decays as this one number instead of row by row.
+    scale: f64,
+    /// The current batch's `[sum p * y | sum d2 - d1]`.
+    batch: Vec<f32>,
+    /// Unit long axis of each cluster, `k * d` values.
+    axes: Vec<f32>,
+}
+
+impl Removal {
+    fn new(k: usize, d: usize, rng: &mut Rng) -> Self {
+        let mut axes: Vec<f32> = Vec::with_capacity(k * d);
+        let mut row = vec![0.0f64; d];
+        for _ in 0..k {
+            row.iter_mut().for_each(|v| *v = rng.normal());
+            let norm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+            axes.extend(row.iter().map(|v| (v / norm) as f32));
+        }
+        Removal {
+            stats: vec![0.0; k * (d + 1)],
+            scale: 1.0,
+            batch: vec![0.0; k * (d + 1)],
+            axes,
+        }
+    }
+
+    /// `scale * |U_j|`.
+    fn axis_norm(&self, j: usize, d: usize) -> f64 {
+        let u = &self.stats[j * (d + 1)..j * (d + 1) + d];
+        self.scale * u.iter().map(|&v| v as f64 * v as f64).sum::<f64>().sqrt()
+    }
+}
+
+/// When each cluster moved during the last pass, counted in rows of that pass.
+/// Only kept by `train`, for the closing handover.
+struct Closing {
+    /// Rows of the last pass assigned so far.
+    done: usize,
+    /// Rows done when each cluster last moved, -1 if it did not move.
+    moved_at: Vec<i64>,
+    /// Every split of the pass: (donor, rows done at the time, revived cluster).
+    splits: Vec<(usize, usize, usize)>,
+}
+
+impl Closing {
+    fn new(k: usize) -> Self {
+        Closing {
+            done: 0,
+            moved_at: vec![-1; k],
+            splits: Vec::new(),
+        }
+    }
 }
 
 impl Trainer {
@@ -460,7 +582,7 @@ impl Trainer {
     /// against the same centroids, the ones from before the batch.
     pub fn accumulate(&mut self, rows: &[f32]) -> Result<()> {
         self.check_rows(rows)?;
-        self.accumulate_rows(Rows::Dense(rows), None)
+        self.accumulate_rows(Rows::Dense(rows), None, None)
     }
 
     /// Like [`Trainer::accumulate`], and also writes each row's nearest centroid into `labels`.
@@ -469,7 +591,7 @@ impl Trainer {
         if labels.len() != rows.len() / self.d {
             return invalid("labels must have one entry per row");
         }
-        self.accumulate_rows(Rows::Dense(rows), Some(labels))
+        self.accumulate_rows(Rows::Dense(rows), Some(labels), None)
     }
 
     fn check_rows(&self, rows: &[f32]) -> Result<()> {
@@ -483,10 +605,15 @@ impl Trainer {
         Ok(())
     }
 
+    fn removal_cost(&self) -> bool {
+        self.recipe.unused_threshold.is_none()
+    }
+
     fn accumulate_rows(
         &mut self,
         rows: Rows<'_>,
         mut labels_out: Option<&mut [i64]>,
+        mut second_out: Option<&mut [u32]>,
     ) -> Result<()> {
         let d = self.d;
         let n = rows.len(d);
@@ -516,6 +643,7 @@ impl Trainer {
         } else {
             Metric::L2
         };
+        let two = self.removal_cost();
         let chunk = self.recipe.chunk_size;
         let mut objective = 0.0f64;
         for begin in (0..n).step_by(chunk) {
@@ -526,32 +654,68 @@ impl Trainer {
             };
             self.dist.resize(end - begin, 0.0);
             self.labels.resize(end - begin, 0);
-            knn::nearest(
-                part,
-                d,
-                &self.centroids,
-                &self.norms,
-                metric,
-                &mut self.dist,
-                &mut self.labels,
-            );
-            for (i, (&dist, &label)) in self.dist.iter().zip(&self.labels).enumerate() {
-                let label = label as usize;
+            if two {
+                self.dist2.resize(end - begin, 0.0);
+                self.labels2.resize(end - begin, 0);
+                knn::nearest_two(
+                    part,
+                    d,
+                    &self.centroids,
+                    &self.norms,
+                    metric,
+                    &mut self.dist,
+                    &mut self.labels,
+                    &mut self.dist2,
+                    &mut self.labels2,
+                );
+            } else {
+                knn::nearest(
+                    part,
+                    d,
+                    &self.centroids,
+                    &self.norms,
+                    metric,
+                    &mut self.dist,
+                    &mut self.labels,
+                );
+            }
+            for &dist in &self.dist {
                 objective += if self.spherical {
                     2.0 - 2.0 * dist as f64
                 } else {
                     dist as f64
                 };
-                self.batch_counts[label] += 1.0;
-                let sums = &mut self.batch_sums[label * d..(label + 1) * d];
-                for (s, &v) in sums.iter_mut().zip(part.row(i, d)) {
-                    *s += v as f64;
-                }
             }
+            if self.removal.is_some() {
+                // The removal cost is d2 - d1. Inner product keeps similarities, and
+                // faiss scores them as -2 * similarity.
+                self.margin.clear();
+                self.margin.extend((0..end - begin).map(|i| {
+                    let margin = match (two, self.spherical) {
+                        (false, _) => 0.0,
+                        (true, false) => self.dist2[i] - self.dist[i],
+                        (true, true) => 2.0 * (self.dist[i] - self.dist2[i]),
+                    };
+                    if margin.is_finite() { margin } else { 0.0 }
+                }));
+            }
+            add_rows(
+                part,
+                d,
+                &self.labels,
+                &self.margin,
+                &self.centroids,
+                self.removal.as_mut(),
+                &mut self.batch_sums,
+                &mut self.batch_counts,
+            );
             if let Some(out) = labels_out.as_deref_mut() {
                 for (o, &l) in out[begin..end].iter_mut().zip(&self.labels) {
                     *o = l as i64;
                 }
+            }
+            if let Some(out) = second_out.as_deref_mut() {
+                out[begin..end].copy_from_slice(&self.labels2);
             }
         }
         self.batch_objective += objective;
@@ -572,6 +736,7 @@ impl Trainer {
             ));
         }
         let alpha = recipe::scheduled_alpha(self.recipe.alpha0, self.step, self.recipe.total_steps);
+        self.update_removal(alpha);
         self.apply_batch(alpha);
         if (self.step + 1).is_multiple_of(recipe::CHECK_UNUSED_EVERY) {
             self.revive_unused();
@@ -631,24 +796,112 @@ impl Trainer {
         }
     }
 
-    /// Split busy clusters to replace the ones that get almost no rows.
-    fn revive_unused(&mut self) {
-        let threshold = self.recipe.unused_threshold;
-        if threshold == 0.0 {
+    /// Fold the batch into the removal costs and the long axes (Oja's rule).
+    fn update_removal(&mut self, alpha: f64) {
+        let Some(removal) = self.removal.as_mut() else {
             return;
-        }
+        };
         let (k, d) = (self.k, self.d);
+        let decay = 1.0 - alpha;
+        let (decay32, alpha32) = (decay as f32, alpha as f32);
+        for j in 0..k {
+            let at = j * (d + 1) + d;
+            removal.stats[at] = decay32 * removal.stats[at] + alpha32 * removal.batch[at];
+        }
+        let mut scale = removal.scale * decay;
+        // Fold the scale back into U before it gets too small for f32.
+        if scale <= 2f64.powi(-32) {
+            for row in removal.stats.chunks_exact_mut(d + 1) {
+                row[..d].iter_mut().for_each(|v| *v *= scale as f32);
+            }
+            scale = 1.0;
+        }
+        removal.scale = scale;
+        let weight = (alpha / scale) as f32;
+        for j in 0..k {
+            if self.batch_counts[j] == 0.0 {
+                continue;
+            }
+            let rows = j * (d + 1)..(j + 1) * (d + 1);
+            let (u, b) = (&mut removal.stats[rows.clone()], &mut removal.batch[rows]);
+            for (u, &b) in u[..d].iter_mut().zip(&b[..d]) {
+                *u += weight * b;
+            }
+            let norm = u[..d]
+                .iter()
+                .map(|&v| v as f64 * v as f64)
+                .sum::<f64>()
+                .sqrt();
+            if norm > 0.0 {
+                for (a, &u) in removal.axes[j * d..(j + 1) * d].iter_mut().zip(&u[..d]) {
+                    *a = (u as f64 / norm) as f32;
+                }
+            }
+            b.fill(0.0);
+        }
+    }
+
+    /// Move clusters that do little to split busy ones.
+    fn revive_unused(&mut self) {
+        let splits = match self.recipe.unused_threshold {
+            None => self.choose_by_cost(),
+            Some(t) if t > 0.0 => self.choose_by_mass(t),
+            Some(_) => return,
+        };
+        if !splits.is_empty() {
+            self.apply_splits(&splits);
+        }
+    }
+
+    /// Every cluster with a removal cost below 0.3 times the median, or not positive,
+    /// moves, cheapest first. The donors are the other clusters, longest axis first.
+    fn choose_by_cost(&self) -> Vec<(usize, usize)> {
+        let (k, d) = (self.k, self.d);
+        let removal = self
+            .removal
+            .as_ref()
+            .expect("cost based revival tracks costs");
+        let cost: Vec<f64> = (0..k)
+            .map(|j| removal.stats[j * (d + 1) + d] as f64)
+            .collect();
+        let mut sorted = cost.clone();
+        sorted.sort_by(f64::total_cmp);
+        let median = if k % 2 == 1 {
+            sorted[k / 2]
+        } else {
+            (sorted[k / 2 - 1] + sorted[k / 2]) / 2.0
+        };
+        let limit = recipe::REMOVAL_THRESHOLD * median;
+        let mut moved: Vec<usize> = (0..k)
+            .filter(|&j| cost[j] <= 0.0 || cost[j] < limit)
+            .collect();
+        if moved.is_empty() {
+            return Vec::new();
+        }
+        moved.sort_by(|&a, &b| cost[a].total_cmp(&cost[b]));
+        let mut is_moved = vec![false; k];
+        moved.iter().for_each(|&j| is_moved[j] = true);
+        let axis: Vec<f32> = (0..k).map(|j| removal.axis_norm(j, d) as f32).collect();
+        let mut donors: Vec<usize> = (0..k)
+            .filter(|&j| self.usage[j] > 0.0 && !is_moved[j])
+            .collect();
+        donors.sort_by(|&a, &b| axis[b].total_cmp(&axis[a]));
+        donors.into_iter().zip(moved).collect()
+    }
+
+    /// Clusters below `threshold` times the mean mass are revived. Donors are drawn
+    /// without replacement in proportion to their mass (Gumbel top-k).
+    fn choose_by_mass(&mut self, threshold: f32) -> Vec<(usize, usize)> {
+        let k = self.k;
         let total: f32 = self.usage.iter().sum();
         let limit = total * threshold / k as f32;
         let unused: Vec<usize> = (0..k).filter(|&j| self.usage[j] < limit).collect();
         let donors: Vec<usize> = (0..k)
             .filter(|&j| self.usage[j] >= limit && self.usage[j] > 0.0)
             .collect();
-        let nsplit = unused.len().min(donors.len());
-        if nsplit == 0 {
-            return;
+        if unused.is_empty() || donors.is_empty() {
+            return Vec::new();
         }
-        // Donors drawn without replacement in proportion to their mass (Gumbel top-k).
         let mut keys: Vec<(f64, usize)> = donors
             .iter()
             .map(|&j| {
@@ -657,32 +910,71 @@ impl Trainer {
             })
             .collect();
         keys.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-        for (&(_, source), &target) in keys.iter().zip(&unused).take(nsplit) {
-            let half = self.usage[source] / 2.0;
-            let base = self.positions[source * d..(source + 1) * d].to_vec();
+        keys.into_iter().map(|(_, j)| j).zip(unused).collect()
+    }
+
+    /// Split each donor into itself and the revived cluster. The two copies go to
+    /// `c -/+ s * u`, with `u` the donor's long axis and `s = sqrt(2 |U| / (pi N))`,
+    /// the means of the two halves of a Gaussian along `u`.
+    fn apply_splits(&mut self, splits: &[(usize, usize)]) {
+        let d = self.d;
+        let removal = self.removal.as_mut().expect("revival tracks the axes");
+        let last_pass = self.pass_sums.is_some();
+        for &(source, target) in splits {
+            let norm = removal.axis_norm(source, d);
+            let mass = self.usage[source] as f64;
+            let spread = if norm > 0.0 && mass > 0.0 && norm.is_finite() && mass.is_finite() {
+                (2.0 * (norm / mass) / std::f64::consts::PI).sqrt()
+            } else {
+                0.0
+            };
             let mut collapsed = true;
-            for (i, &v) in base.iter().enumerate() {
-                let offset = if i % 2 == 0 {
-                    recipe::SPLIT_EPSILON
-                } else {
-                    -recipe::SPLIT_EPSILON
-                };
-                let donor = v * (1.0 - offset);
-                let child = v * (1.0 + offset);
+            for i in 0..d {
+                let c = self.positions[source * d + i] as f64;
+                let offset = spread * removal.axes[source * d + i] as f64;
+                let donor = (c - offset) as f32;
+                let child = (c + offset) as f32;
                 collapsed &= donor == child;
                 self.positions[source * d + i] = donor;
                 self.positions[target * d + i] = child;
             }
             if collapsed {
-                // A zero centroid splits into two equal ones: move the child by one ulp.
+                // Two equal centroids: move the child by one ulp.
                 let v = self.positions[target * d];
                 let up = v.next_up();
                 self.positions[target * d] = if up.is_finite() { up } else { v.next_down() };
             }
+            let half = self.usage[source] / 2.0;
             self.usage[source] = half;
             self.usage[target] = half;
+
+            let (from, to) = (source * (d + 1), target * (d + 1));
+            removal.stats[from..from + d + 1]
+                .iter_mut()
+                .for_each(|v| *v /= 2.0);
+            removal.stats.copy_within(from..from + d + 1, to);
+            removal
+                .axes
+                .copy_within(source * d..(source + 1) * d, target * d);
+
+            match self.closing.as_mut() {
+                Some(closing) => {
+                    closing.moved_at[target] = closing.done as i64;
+                    closing.splits.push((source, closing.done, target));
+                }
+                // Without the handover, a split in the last pass drops what both
+                // clusters got before it, as their rows no longer match.
+                None if last_pass && self.recipe.unused_threshold.is_none() => {
+                    let sums = self.pass_sums.as_mut().unwrap();
+                    for j in [source, target] {
+                        sums[j * d..(j + 1) * d].fill(0.0);
+                        self.pass_counts[j] = 0.0;
+                    }
+                }
+                None => {}
+            }
         }
-        self.n_splits += nsplit;
+        self.n_splits += splits.len();
     }
 
     fn refresh_search(&mut self) {
@@ -741,6 +1033,130 @@ impl Trainer {
             self.start_epoch();
         }
         Ok(())
+    }
+
+    /// Fix the last pass labels after clusters moved during it, then rebuild the sums of
+    /// the clusters involved from the fixed labels.
+    ///
+    /// `order` holds the rows of the last pass in the order they were given, `second` the
+    /// second nearest centroid each row got with its label.
+    fn close_handover(&mut self, x: &[f32], order: &[usize], labels: &mut [i64], second: &[u32]) {
+        let Some(closing) = self.closing.take() else {
+            return;
+        };
+        let (k, d) = (self.k, self.d);
+        let moved_at = &closing.moved_at;
+        if moved_at.iter().all(|&m| m < 0) {
+            return;
+        }
+
+        // A row given to a cluster before that cluster moved goes to its second nearest,
+        // unless that one also moved after the row was given.
+        let mut stale = vec![false; labels.len()];
+        let mut stale_rows = Vec::new();
+        let mut search = Vec::new();
+        for (rank, &i) in order.iter().enumerate() {
+            let rank = rank as i64;
+            if rank >= moved_at[labels[i] as usize] {
+                continue;
+            }
+            stale[i] = true;
+            stale_rows.push(i);
+            let s = second[i] as usize;
+            if s < k && moved_at[s] <= rank {
+                labels[i] = s as i64;
+            } else {
+                search.push(i);
+            }
+        }
+        if !search.is_empty() {
+            let metric = if self.spherical {
+                Metric::InnerProduct
+            } else {
+                Metric::L2
+            };
+            let norms = knn::squared_norms(&self.centroids, d);
+            for part in search.chunks(self.recipe.chunk_size) {
+                self.dist.resize(part.len(), 0.0);
+                self.labels.resize(part.len(), 0);
+                knn::nearest(
+                    Rows::Indexed(x, part),
+                    d,
+                    &self.centroids,
+                    &norms,
+                    metric,
+                    &mut self.dist,
+                    &mut self.labels,
+                );
+                for (&i, &l) in part.iter().zip(&self.labels) {
+                    labels[i] = l as i64;
+                }
+            }
+        }
+
+        // The other rows of a donor, given before its next split, go to the nearer of
+        // the donor and the cluster that split made. The entry with donor k matches no
+        // row and keeps the search below in bounds.
+        let mut splits = closing.splits;
+        splits.push((k, 0, 0));
+        splits.sort_by_key(|&(source, born, _)| (source, born));
+        let centroids = &self.centroids;
+        let distance = |row: &[f32], j: usize| -> f64 {
+            row.iter()
+                .zip(&centroids[j * d..(j + 1) * d])
+                .map(|(&a, &b)| {
+                    let diff = (a - b) as f64;
+                    diff * diff
+                })
+                .sum()
+        };
+        for (rank, &i) in order.iter().enumerate() {
+            if stale[i] {
+                continue;
+            }
+            let own = labels[i] as usize;
+            let next = splits
+                .partition_point(|&(source, born, _)| (source, born) <= (own, rank))
+                .min(splits.len() - 1);
+            let (source, born, child) = splits[next];
+            if source != own || born <= rank || moved_at[child] != born as i64 {
+                continue;
+            }
+            let row = &x[i * d..(i + 1) * d];
+            let (near_own, near_child) = (distance(row, own), distance(row, child));
+            if near_child < near_own || (near_child == near_own && child < own) {
+                labels[i] = child as i64;
+            }
+        }
+
+        let mut rebuild = vec![false; k + 1];
+        for &(source, _, child) in &splits {
+            rebuild[source] = true;
+            rebuild[if source < k { child } else { k }] = true;
+        }
+        for &i in &stale_rows {
+            rebuild[labels[i] as usize] = true;
+        }
+        let sums = self
+            .pass_sums
+            .as_mut()
+            .expect("the last pass keeps its sums");
+        for j in (0..k).filter(|&j| rebuild[j]) {
+            sums[j * d..(j + 1) * d].fill(0.0);
+            self.pass_counts[j] = 0.0;
+        }
+        for &i in order {
+            let l = labels[i] as usize;
+            if rebuild[l] {
+                for (s, &v) in sums[l * d..(l + 1) * d]
+                    .iter_mut()
+                    .zip(&x[i * d..(i + 1) * d])
+                {
+                    *s += v as f64;
+                }
+                self.pass_counts[l] += 1.0;
+            }
+        }
     }
 
     /// Finish the run. Each centroid becomes the exact mean of the rows the last pass gave it.
@@ -917,6 +1333,82 @@ impl Model {
     }
 }
 
+/// Add each row to its cluster's batch sums and count, and to the revival statistics
+/// when there are some: `p * y` with `y` = row - centroid and `p` = `y` along the axis,
+/// and the removal cost from `margin`.
+///
+/// Clusters are split in ranges that run in parallel. Each range scans every row and
+/// adds its own clusters' rows in row order, so the result does not depend on the
+/// number of threads.
+#[allow(clippy::too_many_arguments)]
+fn add_rows(
+    rows: Rows<'_>,
+    d: usize,
+    labels: &[u32],
+    margin: &[f32],
+    centroids: &[f32],
+    removal: Option<&mut Removal>,
+    sums: &mut [f64],
+    counts: &mut [f64],
+) {
+    let (axes, batch): (&[f32], &mut [f32]) = match removal {
+        Some(r) => (&r.axes, &mut r.batch),
+        None => (&[], &mut []),
+    };
+    let add = |first: usize, sums: &mut [f64], counts: &mut [f64], batch: &mut [f32]| {
+        let last = first + counts.len();
+        for (i, &label) in labels.iter().enumerate() {
+            let label = label as usize;
+            if label < first || label >= last {
+                continue;
+            }
+            let (j, row) = (label - first, rows.row(i, d));
+            counts[j] += 1.0;
+            for (s, &v) in sums[j * d..(j + 1) * d].iter_mut().zip(row) {
+                *s += v as f64;
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            let centroid = &centroids[label * d..(label + 1) * d];
+            let axis = &axes[label * d..(label + 1) * d];
+            let p: f32 = row
+                .iter()
+                .zip(centroid)
+                .zip(axis)
+                .map(|((&x, &c), &a)| (x - c) * a)
+                .sum();
+            let stats = &mut batch[j * (d + 1)..(j + 1) * (d + 1)];
+            for ((s, &x), &c) in stats.iter_mut().zip(row).zip(centroid) {
+                *s += p * (x - c);
+            }
+            stats[d] += margin[i];
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        // A few ranges per thread, so uneven ranges still balance.
+        let k = counts.len();
+        let per = k.div_ceil(4 * rayon::current_num_threads()).max(1);
+        let batch_per = if batch.is_empty() { 0 } else { per * (d + 1) };
+        let mut batches: Vec<&mut [f32]> = if batch_per == 0 {
+            Vec::new()
+        } else {
+            batch.chunks_mut(batch_per).collect()
+        };
+        batches.resize_with(k.div_ceil(per), Default::default);
+        sums.par_chunks_mut(per * d)
+            .zip(counts.par_chunks_mut(per))
+            .zip(batches.into_par_iter())
+            .enumerate()
+            .for_each(|(r, ((sums, counts), batch))| add(r * per, sums, counts, batch));
+    }
+    #[cfg(not(feature = "parallel"))]
+    add(0, sums, counts, batch);
+}
+
 /// Scale a row to norm 1. Divides by the largest value first so the norm cannot overflow.
 /// A zero row stays zero.
 fn normalize(row: &mut [f32]) {
@@ -938,5 +1430,54 @@ fn normalize_f64(row: &mut [f64]) {
     let norm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
     if norm > 0.0 {
         row.iter_mut().for_each(|v| *v /= norm);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_revival_moves_every_cheap_cluster() {
+        // Same case as the faiss test: costs [1, 100, 0, 100], axis lengths [1, 3, 2, 4].
+        // Clusters 2 and 0 move, cheapest first, to split 3 and then 1.
+        let mut t = Emeans::new(1, 4)
+            .nepochs(1.0)
+            .batch_size(4)
+            .begin(4, &[0.0, 1.0, -2.0, 10.0])
+            .unwrap();
+        t.usage = vec![1.0; 4];
+        let removal = t.removal.as_mut().unwrap();
+        for (j, (cost, axis)) in [(1.0, 1.0), (100.0, 3.0), (0.0, 2.0), (100.0, 4.0)]
+            .into_iter()
+            .enumerate()
+        {
+            removal.stats[j * 2] = axis;
+            removal.stats[j * 2 + 1] = cost;
+        }
+        assert_eq!(t.choose_by_cost(), vec![(3, 2), (1, 0)]);
+    }
+
+    #[test]
+    fn split_copies_sit_on_the_donor_axis() {
+        let mut t = Emeans::new(2, 2).begin(10, &[1.0, 1.0, 5.0, 5.0]).unwrap();
+        t.usage = vec![4.0, 0.0];
+        let removal = t.removal.as_mut().unwrap();
+        removal.axes = vec![1.0, 0.0, 0.0, 1.0];
+        // |U| = 2 * pi, N = 4: s = sqrt(2 * 2 * pi / (pi * 4)) = 1.
+        removal.stats[..3].copy_from_slice(&[2.0 * std::f32::consts::PI, 0.0, 0.5]);
+        t.apply_splits(&[(0, 1)]);
+        let expected = [0.0, 1.0, 2.0, 1.0];
+        assert!(
+            t.positions
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < 1e-6)
+        );
+        assert_eq!(t.usage, vec![2.0, 2.0]);
+        let removal = t.removal.as_ref().unwrap();
+        assert_eq!(&removal.stats[..3], &removal.stats[3..]);
+        assert_eq!(removal.stats[2], 0.25);
+        assert_eq!(removal.axes, vec![1.0, 0.0, 1.0, 0.0]);
     }
 }

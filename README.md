@@ -2,7 +2,7 @@
 
 Rust port of [e-means](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means) from faiss, with Python bindings. e-means is a k-means replacement from Meta FAIR that reaches a lower error in about a tenth of the passes ([paper](https://arxiv.org/abs/2611.09501)).
 
-This ports the CPU version (`NumpyEmeans`). Results match the Python code: same input, order and starting centroids give the same centroids within 1e-4 (`tests/parity.rs`).
+This ports the CPU version (`NumpyEmeans`), up to faiss commit [`1bafdcc`](https://github.com/facebookresearch/faiss/commit/1bafdcc965) (2026-11-25). With revival off, results match the Python code: same input, order and starting centroids give the same centroids within 1e-4 (`tests/parity.rs`).
 
 ## What is faster
 
@@ -59,6 +59,8 @@ Other Rust crates on the same Intel machine, 5 iterations, time / error / peak m
 
 Run it yourself: `cargo run --release --example bench -- 1000000 128 1024`.
 
+These numbers are from 0.1.2. On a 16 core AMD machine (Azure), 0.2.0 trains within 20% of 0.1.2 either way, and reaches a lower error thanks to the new revival.
+
 ## Python
 
 ```
@@ -81,7 +83,7 @@ Training releases the GIL. For data bigger than memory, the faiss loop works as 
 
 ```toml
 [dependencies]
-emeans = "0.1"
+emeans = "0.2"
 ```
 
 ```rust
@@ -93,10 +95,19 @@ let (distances, nearest) = model.assign(&x_new)?;
 
 For data bigger than memory, use `Emeans::begin` and feed batches yourself (see the docs).
 
+## Cluster revival
+
+Since 0.2.0, revival follows faiss main ([#5915](https://github.com/facebookresearch/faiss/pull/5915)). Each cluster tracks its removal cost, how much the error would grow without it (the gap between each row's nearest and second nearest centroid), and its long axis. Every 5 updates, the clusters that cost less than 0.3 times the median move to split the clusters with the longest axes, and the two halves go to the means of a Gaussian cut along that axis. Revival keeps going in the last pass, and `train` then fixes the labels of rows whose cluster moved after they were assigned (`closing_handover`, on by default).
+
+On clustered test data, this gives 2-9% lower error than the old rule, the same gain as faiss main.
+
+`unused_threshold(0.1)` brings back the old mass based rule, `unused_threshold(0.0)` turns revival off.
+
 ## Differences from faiss
 
 - The random generator is not numpy's, so the same seed gives a different (equally good) run.
 - Batch sums are added in f64.
+- faiss-cpu 1.16 on pip predates the new revival. Pass `unused_threshold=0.1` to compare against it.
 - GPU kernels, multi GPU classes and 8/16 bit formats are not ported.
 
 ## License

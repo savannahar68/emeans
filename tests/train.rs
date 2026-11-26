@@ -425,3 +425,16 @@ fn spherical_cost_based_revival_runs() {
         assert!((norm - 1.0).abs() < 1e-5);
     }
 }
+
+#[test]
+fn duplicate_rows_stay_in_the_lowest_cluster() {
+    // Every centroid starts on the same row. No split can gain anything, so nothing
+    // moves, ties go to the lower index, and the labels match a fresh search.
+    let d = 4;
+    let x: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0].repeat(3);
+    for seed in 0..4 {
+        let model = Emeans::new(d, 2).seed(seed).train(&x).unwrap();
+        assert_eq!(model.labels().unwrap(), &[0, 0, 0]);
+        assert_eq!(model.assign(&x).unwrap().1, vec![0, 0, 0]);
+    }
+}

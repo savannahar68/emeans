@@ -924,12 +924,16 @@ impl Trainer {
         donors.sort_by(|&a, &b| axis[b].total_cmp(&axis[a]));
         // A pair moves only if the donor's split gains more than the move costs,
         // (2 / pi) |U| > R. Costs rise and gains fall along the list, so the pairs
-        // that pay come first.
+        // that pay come first. A donor with no spread gains nothing, so even a free
+        // move onto it would only make a copy (duplicate rows).
         let gain = 2.0 / std::f64::consts::PI;
         donors
             .into_iter()
             .zip(moved)
-            .take_while(|&(donor, j)| cost[j] <= 0.0 || gain * axis[donor] as f64 > cost[j])
+            .take_while(|&(donor, j)| {
+                let gain = gain * axis[donor] as f64;
+                gain > 0.0 && (cost[j] <= 0.0 || gain > cost[j])
+            })
             .collect()
     }
 
@@ -1325,6 +1329,9 @@ impl Model {
     ///
     /// These labels come for free but are not always the nearest final centroid, since
     /// the centroids still moved during the last pass. Call [`Model::assign`] for exact ones.
+    ///
+    /// With more centroids than distinct rows, some clusters stay empty. Exact ties go
+    /// to the lower index, so duplicate rows land in the lowest of the tied clusters.
     pub fn labels(&self) -> Option<&[i64]> {
         self.labels.as_deref()
     }

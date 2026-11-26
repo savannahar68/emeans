@@ -132,8 +132,8 @@ impl Emeans {
         self
     }
 
-    /// With cost based revival, a cluster can move during the last pass after some rows
-    /// were already given to it. When this is on (the default) and the labels are kept,
+    /// Revival can move a cluster during the last pass after some rows were already
+    /// given to it. When this is on (the default) and the labels are kept,
     /// `train` fixes those rows at the end: they go to their second nearest centroid, or
     /// are searched again if that one moved too. Each centroid is then the mean of its
     /// final rows.
@@ -307,7 +307,9 @@ impl Emeans {
         };
         let mut trainer = self.begin(n, init)?;
         let mut labels = self.capture_assignments.then(|| vec![-1i64; n]);
-        let handover = labels.is_some() && self.closing_handover && trainer.removal_cost();
+        // Any revival can move a cluster after rows were given to it. Mass based revival
+        // only searches the second nearest centroid in the last pass, for this.
+        let handover = labels.is_some() && self.closing_handover && trainer.removal.is_some();
         let mut second = if handover {
             vec![u32::MAX; n]
         } else {
@@ -362,6 +364,9 @@ impl Emeans {
             trainer.close_handover(x, &order[..epochs[epochs.len() - 1]], labels, &second);
         }
         let mut model = trainer.finalize()?;
+        if let Some(labels) = labels.as_mut() {
+            lowest_twin(&model.centroids, d, labels);
+        }
         model.labels = labels;
         Ok(model)
     }
@@ -651,7 +656,7 @@ impl Trainer {
         } else {
             Metric::L2
         };
-        let two = self.removal_cost();
+        let two = self.removal_cost() || second_out.is_some();
         let chunk = self.recipe.chunk_size;
         let mut objective = 0.0f64;
         for begin in (0..n).step_by(chunk) {
@@ -968,6 +973,7 @@ impl Trainer {
         let d = self.d;
         let removal = self.removal.as_mut().expect("revival tracks the axes");
         let last_pass = self.pass_sums.is_some();
+        let mut done = 0;
         for &(source, target) in splits {
             let norm = removal.axis_norm(source, d);
             let mass = self.usage[source] as f64;
@@ -976,22 +982,21 @@ impl Trainer {
             } else {
                 0.0
             };
-            let mut collapsed = true;
+            let (mut donor, mut child) = (vec![0.0f32; d], vec![0.0f32; d]);
             for i in 0..d {
                 let c = self.positions[source * d + i] as f64;
                 let offset = spread * removal.axes[source * d + i] as f64;
-                let donor = (c - offset) as f32;
-                let child = (c + offset) as f32;
-                collapsed &= donor == child;
-                self.positions[source * d + i] = donor;
-                self.positions[target * d + i] = child;
+                donor[i] = (c - offset) as f32;
+                child[i] = (c + offset) as f32;
             }
-            if collapsed {
-                // Two equal centroids: move the child by one ulp.
-                let v = self.positions[target * d];
-                let up = v.next_up();
-                self.positions[target * d] = if up.is_finite() { up } else { v.next_down() };
+            // A donor with no spread (duplicate rows) would only get a copy of itself,
+            // which takes no rows and ties with it in every search.
+            if donor == child {
+                continue;
             }
+            self.positions[source * d..(source + 1) * d].copy_from_slice(&donor);
+            self.positions[target * d..(target + 1) * d].copy_from_slice(&child);
+            done += 1;
             let half = self.usage[source] / 2.0;
             self.usage[source] = half;
             self.usage[target] = half;
@@ -1025,7 +1030,7 @@ impl Trainer {
                 None => {}
             }
         }
-        self.n_splits += splits.len();
+        self.n_splits += done;
     }
 
     fn refresh_search(&mut self) {
@@ -1328,7 +1333,13 @@ impl Model {
     /// came from the batch loop.
     ///
     /// These labels come for free but are not always the nearest final centroid, since
-    /// the centroids still moved during the last pass. Call [`Model::assign`] for exact ones.
+    /// the centroids still moved during the last pass: on clustered data, 0.5 to 3% of
+    /// rows differ from [`Model::assign`]. Call it for exact ones.
+    ///
+    /// With `closing_handover` on (the default), a cluster that moved during the last
+    /// pass gives back the rows it had before, in both revival modes. In our tests a
+    /// cluster with no label never held a row under [`Model::assign`], but this is not
+    /// guaranteed: a row can end nearer to a centroid that has no label.
     ///
     /// With more centroids than distinct rows, some clusters stay empty. Exact ties go
     /// to the lower index, so duplicate rows land in the lowest of the tied clusters.
@@ -1478,6 +1489,26 @@ fn add_rows(
     }
     #[cfg(not(feature = "parallel"))]
     add(0, sums, counts, batch, heir);
+}
+
+/// Rows of centroids that sit exactly on a lower one go to the lowest, as a search
+/// breaks ties by index. The centroids do not change.
+fn lowest_twin(centroids: &[f32], d: usize, labels: &mut [i64]) {
+    let mut first = std::collections::HashMap::new();
+    let lowest: Vec<i64> = centroids
+        .chunks_exact(d)
+        .enumerate()
+        .map(|(j, row)| {
+            let key: Vec<u32> = row.iter().map(|v| (v + 0.0).to_bits()).collect();
+            *first.entry(key).or_insert(j as i64)
+        })
+        .collect();
+    if lowest.iter().enumerate().all(|(j, &l)| l == j as i64) {
+        return;
+    }
+    for l in labels.iter_mut().filter(|l| **l >= 0) {
+        *l = lowest[*l as usize];
+    }
 }
 
 /// Scale a row to norm 1. Divides by the largest value first so the norm cannot overflow.

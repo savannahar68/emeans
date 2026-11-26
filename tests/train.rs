@@ -438,3 +438,64 @@ fn duplicate_rows_stay_in_the_lowest_cluster() {
         assert_eq!(model.assign(&x).unwrap().1, vec![0, 0, 0]);
     }
 }
+
+/// Clusters with no label but rows under a fresh search of the final centroids.
+fn label_free_with_rows(model: &emeans::Model, x: &[f32], k: usize) -> usize {
+    let mut labelled = vec![false; k];
+    for &l in model.labels().unwrap() {
+        labelled[l as usize] = true;
+    }
+    let (_, nearest) = model.assign(x).unwrap();
+    let mut found = vec![false; k];
+    for &l in &nearest {
+        found[l as usize] = true;
+    }
+    (0..k).filter(|&j| found[j] && !labelled[j]).count()
+}
+
+#[test]
+fn a_cluster_without_labels_has_no_rows() {
+    // More centroids than distinct rows: 3 groups of 20 rows with 7 distinct values
+    // each, k = 60, some starting rows repeated. Revival moves clusters in the last
+    // pass in both modes.
+    let (d, k) = (16, 60);
+    let mut x = Vec::new();
+    for c in 0..3 {
+        for r in 0..20 {
+            for j in 0..d {
+                let base = if j == c { 10.0 } else { 0.0 };
+                x.push(base + ((c * 20 + r + j) % 7) as f32 * 0.01);
+            }
+        }
+    }
+    let init: Vec<f32> = (0..k)
+        .flat_map(|i| {
+            let r = (i * 7) % 60;
+            x[r * d..(r + 1) * d].to_vec()
+        })
+        .collect();
+    for mass in [None, Some(0.1)] {
+        let mut em = Emeans::new(d, k).seed(42);
+        if let Some(t) = mass {
+            em = em.unused_threshold(t);
+        }
+        let model = em.train_from(&x, &init).unwrap();
+        assert_eq!(label_free_with_rows(&model, &x, k), 0, "{mass:?}");
+    }
+    // And on ordinary data.
+    for mass in [None, Some(0.1)] {
+        for seed in 1..=3 {
+            let x = gaussian_blobs(20_000, 8, 16, 10.0, seed);
+            let mut em = Emeans::new(8, 64).seed(seed);
+            if let Some(t) = mass {
+                em = em.unused_threshold(t);
+            }
+            let model = em.train(&x).unwrap();
+            assert_eq!(
+                label_free_with_rows(&model, &x, 64),
+                0,
+                "{mass:?} seed {seed}"
+            );
+        }
+    }
+}

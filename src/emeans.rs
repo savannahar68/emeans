@@ -922,7 +922,15 @@ impl Trainer {
             .filter(|&j| self.usage[j] > 0.0 && !is_moved[j])
             .collect();
         donors.sort_by(|&a, &b| axis[b].total_cmp(&axis[a]));
-        donors.into_iter().zip(moved).collect()
+        // A pair moves only if the donor's split gains more than the move costs,
+        // (2 / pi) |U| > R. Costs rise and gains fall along the list, so the pairs
+        // that pay come first.
+        let gain = 2.0 / std::f64::consts::PI;
+        donors
+            .into_iter()
+            .zip(moved)
+            .take_while(|&(donor, j)| cost[j] <= 0.0 || gain * axis[donor] as f64 > cost[j])
+            .collect()
     }
 
     /// Clusters below `threshold` times the mean mass are revived. Donors are drawn

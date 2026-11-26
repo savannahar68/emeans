@@ -2,7 +2,7 @@
 
 Rust port of [e-means](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means) from faiss, with Python bindings. e-means is a k-means replacement from Meta FAIR that reaches a lower error in about a tenth of the passes ([paper](https://arxiv.org/abs/2611.09501)).
 
-This ports the CPU version (`NumpyEmeans`), up to faiss commit [`1bafdcc`](https://github.com/facebookresearch/faiss/commit/1bafdcc965) (2026-11-25). With revival off, results match the Python code: same input, order and starting centroids give the same centroids within 1e-4 (`tests/parity.rs`).
+This ports the CPU version (`NumpyEmeans`), up to faiss commit [`0c0f203`](https://github.com/facebookresearch/faiss/commit/0c0f203669) (2026-11-25). With revival off, results match the Python code: same input, order and starting centroids give the same centroids within 1e-4 (`tests/parity.rs`).
 
 ## What is faster
 
@@ -97,9 +97,9 @@ For data bigger than memory, use `Emeans::begin` and feed batches yourself (see 
 
 ## Cluster revival
 
-Since 0.2.0, revival follows faiss main ([#5915](https://github.com/facebookresearch/faiss/pull/5915)). Each cluster tracks its removal cost, how much the error would grow without it (the gap between each row's nearest and second nearest centroid), and its long axis. Every 5 updates, the clusters that cost less than 0.3 times the median move to split the clusters with the longest axes, and the two halves go to the means of a Gaussian cut along that axis. Revival keeps going in the last pass, and `train` then fixes the labels of rows whose cluster moved after they were assigned (`closing_handover`, on by default).
+Since 0.2.0, revival follows faiss main ([#5915](https://github.com/facebookresearch/faiss/pull/5915)). Each cluster tracks its removal cost, how much the error would grow without it (the gap between each row's nearest and second nearest centroid), and its long axis. Every 5 updates, the clusters that cost less than 0.3 times the median move to split the clusters with the longest axes, as long as the split gains more than the move costs ([#5975](https://github.com/facebookresearch/faiss/pull/5975)). The two halves go to the means of a Gaussian cut along the axis. Revival keeps going in the last pass, and `train` then fixes the labels of rows whose cluster moved after they were assigned (`closing_handover`, on by default).
 
-Two changes on top of faiss main, since 0.2.1. A cluster does not move in the same round as the cluster that would take its rows, so two centroids sharing a blob cannot both leave it. A cluster that got no row in a whole pass counts as costing nothing. Without these, on tight blobs of very different sizes, up to half of the clusters ended empty (faiss main does the same).
+Two changes on top of faiss main, since 0.2.1. A cluster does not move in the same round as the cluster that would take its rows, so two centroids sharing a blob cannot both leave it. A cluster that got no row in a whole pass counts as costing nothing. Without these, on tight blobs of very different sizes, up to half of the clusters ended empty. faiss main still does on some inputs ([#5988](https://github.com/facebookresearch/faiss/issues/5988)).
 
 On clustered test data, this gives 2-9% lower error than the old rule, the same gain as faiss main.
 

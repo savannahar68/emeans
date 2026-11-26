@@ -105,7 +105,8 @@ impl Emeans {
     /// Without this call, revival is cost based. Each cluster tracks how much the error
     /// would grow without it (the gap between each point's nearest and second nearest
     /// centroid) and its long axis. Every 5 updates, the clusters that cost less than
-    /// 0.3 times the median move to split the clusters with the longest axes.
+    /// 0.3 times the median move to split the clusters with the longest axes. A cluster
+    /// with no row in a whole pass costs nothing.
     pub fn unused_threshold(mut self, threshold: f32) -> Self {
         self.unused_threshold = Some(threshold);
         self
@@ -505,6 +506,11 @@ struct Removal {
     batch: Vec<f32>,
     /// Unit long axis of each cluster, `k * d` values.
     axes: Vec<f32>,
+    /// Where each cluster's rows would go without it: the second nearest centroid of
+    /// the last row it got. `u32::MAX` until it gets one.
+    heir: Vec<u32>,
+    /// Rows given since each cluster last got one.
+    quiet: Vec<usize>,
 }
 
 impl Removal {
@@ -521,6 +527,8 @@ impl Removal {
             scale: 1.0,
             batch: vec![0.0; k * (d + 1)],
             axes,
+            heir: vec![u32::MAX; k],
+            quiet: vec![0; k],
         }
     }
 
@@ -703,6 +711,7 @@ impl Trainer {
                 part,
                 d,
                 &self.labels,
+                if two { &self.labels2 } else { &[] },
                 &self.margin,
                 &self.centroids,
                 self.removal.as_mut(),
@@ -818,10 +827,13 @@ impl Trainer {
         }
         removal.scale = scale;
         let weight = (alpha / scale) as f32;
+        let given = self.pending;
         for j in 0..k {
             if self.batch_counts[j] == 0.0 {
+                removal.quiet[j] += given;
                 continue;
             }
+            removal.quiet[j] = 0;
             let rows = j * (d + 1)..(j + 1) * (d + 1);
             let (u, b) = (&mut removal.stats[rows.clone()], &mut removal.batch[rows]);
             for (u, &b) in u[..d].iter_mut().zip(&b[..d]) {
@@ -861,8 +873,18 @@ impl Trainer {
             .removal
             .as_ref()
             .expect("cost based revival tracks costs");
+        // The cost of a cluster that stopped getting rows only fades, as fast as every
+        // other cost, so it may never fall below the median. A cluster that got no row
+        // in a whole pass owns none, and costs nothing.
+        let pass = self.recipe.epoch_rows.iter().copied().max().unwrap_or(0);
         let cost: Vec<f64> = (0..k)
-            .map(|j| removal.stats[j * (d + 1) + d] as f64)
+            .map(|j| {
+                if removal.quiet[j] >= pass {
+                    0.0
+                } else {
+                    removal.stats[j * (d + 1) + d] as f64
+                }
+            })
             .collect();
         let mut sorted = cost.clone();
         sorted.sort_by(f64::total_cmp);
@@ -872,15 +894,29 @@ impl Trainer {
             (sorted[k / 2 - 1] + sorted[k / 2]) / 2.0
         };
         let limit = recipe::REMOVAL_THRESHOLD * median;
-        let mut moved: Vec<usize> = (0..k)
+        let mut cheap: Vec<usize> = (0..k)
             .filter(|&j| cost[j] <= 0.0 || cost[j] < limit)
             .collect();
-        if moved.is_empty() {
+        if cheap.is_empty() {
             return Vec::new();
         }
-        moved.sort_by(|&a, &b| cost[a].total_cmp(&cost[b]));
+        cheap.sort_by(|&a, &b| cost[a].total_cmp(&cost[b]));
+        // Each cost assumes the rest stay, so a cluster cannot move together with the
+        // one that takes its rows. Otherwise two twins on a blob both leave it.
         let mut is_moved = vec![false; k];
-        moved.iter().for_each(|&j| is_moved[j] = true);
+        let mut kept = vec![false; k];
+        let mut moved = Vec::with_capacity(cheap.len());
+        for j in cheap {
+            let heir = removal.heir[j] as usize;
+            if kept[j] || (heir < k && is_moved[heir]) {
+                continue;
+            }
+            is_moved[j] = true;
+            moved.push(j);
+            if heir < k {
+                kept[heir] = true;
+            }
+        }
         let axis: Vec<f32> = (0..k).map(|j| removal.axis_norm(j, d) as f32).collect();
         let mut donors: Vec<usize> = (0..k)
             .filter(|&j| self.usage[j] > 0.0 && !is_moved[j])
@@ -956,6 +992,9 @@ impl Trainer {
             removal
                 .axes
                 .copy_within(source * d..(source + 1) * d, target * d);
+            removal.heir[source] = target as u32;
+            removal.heir[target] = source as u32;
+            removal.quiet[target] = 0;
 
             match self.closing.as_mut() {
                 Some(closing) => {
@@ -1345,17 +1384,22 @@ fn add_rows(
     rows: Rows<'_>,
     d: usize,
     labels: &[u32],
+    second: &[u32],
     margin: &[f32],
     centroids: &[f32],
     removal: Option<&mut Removal>,
     sums: &mut [f64],
     counts: &mut [f64],
 ) {
-    let (axes, batch): (&[f32], &mut [f32]) = match removal {
-        Some(r) => (&r.axes, &mut r.batch),
-        None => (&[], &mut []),
+    let (axes, batch, heir): (&[f32], &mut [f32], &mut [u32]) = match removal {
+        Some(r) => (&r.axes, &mut r.batch, &mut r.heir),
+        None => (&[], &mut [], &mut []),
     };
-    let add = |first: usize, sums: &mut [f64], counts: &mut [f64], batch: &mut [f32]| {
+    let add = |first: usize,
+               sums: &mut [f64],
+               counts: &mut [f64],
+               batch: &mut [f32],
+               heir: &mut [u32]| {
         let last = first + counts.len();
         for (i, &label) in labels.iter().enumerate() {
             let label = label as usize;
@@ -1383,6 +1427,9 @@ fn add_rows(
                 *s += p * (x - c);
             }
             stats[d] += margin[i];
+            if !second.is_empty() && second[i] != u32::MAX {
+                heir[j] = second[i];
+            }
         }
     };
 
@@ -1399,14 +1446,23 @@ fn add_rows(
             batch.chunks_mut(batch_per).collect()
         };
         batches.resize_with(k.div_ceil(per), Default::default);
+        let mut heirs: Vec<&mut [u32]> = if heir.is_empty() {
+            Vec::new()
+        } else {
+            heir.chunks_mut(per).collect()
+        };
+        heirs.resize_with(k.div_ceil(per), Default::default);
         sums.par_chunks_mut(per * d)
             .zip(counts.par_chunks_mut(per))
             .zip(batches.into_par_iter())
+            .zip(heirs.into_par_iter())
             .enumerate()
-            .for_each(|(r, ((sums, counts), batch))| add(r * per, sums, counts, batch));
+            .for_each(|(r, (((sums, counts), batch), heir))| {
+                add(r * per, sums, counts, batch, heir)
+            });
     }
     #[cfg(not(feature = "parallel"))]
-    add(0, sums, counts, batch);
+    add(0, sums, counts, batch, heir);
 }
 
 /// Scale a row to norm 1. Divides by the largest value first so the norm cannot overflow.

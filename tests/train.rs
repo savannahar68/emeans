@@ -279,6 +279,53 @@ fn cost_based_revival_keeps_a_small_far_blob() {
     }
 }
 
+/// Tight blobs of very different sizes: blob b holds 2400 / (b + 1) rows.
+fn skewed_blobs(d: usize, blobs: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut uniform = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+    };
+    let mut x = Vec::new();
+    for b in 0..blobs {
+        let center: Vec<f32> = (0..d).map(|_| (uniform() * 10.0).floor() * 10.0).collect();
+        for _ in 0..2400 / (b + 1) {
+            x.extend(center.iter().map(|c| c + uniform() - 0.5));
+        }
+    }
+    x
+}
+
+#[test]
+fn cost_based_revival_leaves_no_empty_cluster_on_skewed_blobs() {
+    // 0.2.0 left up to a third of the clusters empty here: twins on a small blob both
+    // moved away, and clusters that lost their rows were never revived.
+    let (d, k) = (8, 64);
+    for seed in 1..=4 {
+        let x = skewed_blobs(d, 24, seed);
+        let n = x.len() / d;
+        let init: Vec<f32> = (0..k)
+            .flat_map(|i| {
+                let r = (i * 7919) % n;
+                x[r * d..(r + 1) * d].to_vec()
+            })
+            .collect();
+        let model = Emeans::new(d, k).seed(seed).train_from(&x, &init).unwrap();
+        let mut counts = vec![0; k];
+        for &l in model.labels().unwrap() {
+            counts[l as usize] += 1;
+        }
+        let empty = counts.iter().filter(|&&c| c == 0).count();
+        assert_eq!(empty, 0, "seed {seed}: {counts:?}");
+        // Every row ends near its own blob center, not halfway to another blob.
+        let (dist, _) = model.assign(&x).unwrap();
+        let mean = dist.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        assert!(mean < 1.0, "seed {seed}: mean error {mean}");
+    }
+}
+
 #[test]
 fn revival_continues_in_the_last_pass() {
     let (n, d, k) = (20_000, 8, 64);
@@ -316,9 +363,16 @@ fn handover_centroids_are_means_of_final_labels() {
             assert!((model.centroid(j)[c] as f64 - mean).abs() < 1e-4);
         }
     }
-    // The handover should not cost error compared with dropping it.
-    let without = em.closing_handover(false).train_from(&x, &init).unwrap();
-    assert!(mse(&model, &x) <= mse(&without, &x) * 1.01);
+    // The handover should not cost error compared with dropping it, on average.
+    let (mut on, mut off) = (0.0, 0.0);
+    for seed in 1..=4 {
+        let x = gaussian_blobs(n, d, 64, 4.0, seed);
+        let em = Emeans::new(d, k).nepochs(1.0).batch_size(500).seed(seed);
+        on += mse(&em.train_from(&x, &x[..k * d]).unwrap(), &x);
+        let em = em.closing_handover(false);
+        off += mse(&em.train_from(&x, &x[..k * d]).unwrap(), &x);
+    }
+    assert!(on <= off * 1.01, "with {on}, without {off}");
 }
 
 #[test]

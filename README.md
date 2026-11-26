@@ -99,6 +99,8 @@ For data bigger than memory, use `Emeans::begin` and feed batches yourself (see 
 
 Since 0.2.0, revival follows faiss main ([#5915](https://github.com/facebookresearch/faiss/pull/5915)). Each cluster tracks its removal cost, how much the error would grow without it (the gap between each row's nearest and second nearest centroid), and its long axis. Every 5 updates, the clusters that cost less than 0.3 times the median move to split the clusters with the longest axes, and the two halves go to the means of a Gaussian cut along that axis. Revival keeps going in the last pass, and `train` then fixes the labels of rows whose cluster moved after they were assigned (`closing_handover`, on by default).
 
+Two changes on top of faiss main, since 0.2.1. A cluster does not move in the same round as the cluster that would take its rows, so two centroids sharing a blob cannot both leave it. A cluster that got no row in a whole pass counts as costing nothing. Without these, on tight blobs of very different sizes, up to half of the clusters ended empty (faiss main does the same).
+
 On clustered test data, this gives 2-9% lower error than the old rule, the same gain as faiss main.
 
 `unused_threshold(0.1)` brings back the old mass based rule, `unused_threshold(0.0)` turns revival off.
@@ -108,6 +110,7 @@ On clustered test data, this gives 2-9% lower error than the old rule, the same 
 - The random generator is not numpy's, so the same seed gives a different (equally good) run.
 - Batch sums are added in f64.
 - faiss-cpu 1.16 on pip predates the new revival. Pass `unused_threshold=0.1` to compare against it.
+- Cost based revival keeps a cluster and the one that takes its rows from moving together, and treats a cluster with no row in a whole pass as dead (see above).
 - GPU kernels, multi GPU classes and 8/16 bit formats are not ported.
 
 ## License

@@ -1,6 +1,6 @@
 [package]
 name = "emeans"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.89"
 description = "e-means clustering in Rust, a port of the CPU version from faiss/contrib/e_means"
